@@ -23,9 +23,14 @@ class ClassificationResult(BaseModel):
     hierarchy: Literal["初中", "高中", "本科", "硕士及以上"]
     difficulty: Literal["基础", "进阶", "竞赛"]
 
+class TrapResult(BaseModel):
+    is_trap: bool
+    trap_reason: str
+
 class JudgeResult(BaseModel):
     confidence: int
     decision: Literal["Match", "Mismatch", "Error"]
+    verified_ans: str
 
 class GraphState(TypedDict):
     question_id: str
@@ -33,16 +38,19 @@ class GraphState(TypedDict):
     ground_truth: str
     problem_type: str
     trap_analysis: bool
+    trap_reason: str
     generated_code: str
     execution_output: str
     confidence_score: float
     final_decision: str
+    verified_ans: str
     hierarchy: str
     difficulty: str
 
 
 def type_classifier_node(state: GraphState):
     """Node 1: 分类器"""
+    print("\n---> [Node: type_classifier] 开始执行...", flush=True)
     question = state.get("question_context", "")
     prompt = os.getenv("TYPE_CLASSIFIER_PROMPT", "You are an expert math problem classifier...")
     support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
@@ -93,6 +101,7 @@ def type_classifier_node(state: GraphState):
 
 def code_generator_node(state: GraphState, config: RunnableConfig = None):
     """Node 2: 代码生成器"""
+    print("\n---> [Node: code_generator] 开始执行...", flush=True)
     question = state.get("question_context", "")
     problem_type = state.get("problem_type", "代数")
     thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
@@ -117,23 +126,44 @@ def code_generator_node(state: GraphState, config: RunnableConfig = None):
                 ],
                 temperature=1.0,
                 stream=True,
-                timeout=15.0  # 若15s无响应抛出异常，触发重试
+                timeout=60.0  # 扩大到60s。此处为底层连接读取的间隔超时，接收CoT片段时不会判定为超时
             )
             
-            full_content = ""
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    full_content += chunk.choices[0].delta.content
-                    if thread_id:
-                        streaming_store[thread_id] = full_content
+            display_content = ""  # 用于前端实时展示，包含 CoT 和正文
+            final_content = ""    # 仅包含正文，用于最终正则提取代码
             
-            # 使用正则提取 Markdown 格式中的 python 代码块
-            match = re.search(r'```python\n(.*?)\n```', full_content, re.DOTALL)
+            print("\n--- [Code Generator] 开始流式输出 ---\n", end="")
+            for chunk in response:
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    delta_dict = delta.model_dump()
+                    
+                    # 1. 获取并拼接思维链内容 (CoT)
+                    reasoning = delta_dict.get("reasoning_content")
+                    if reasoning:
+                        display_content += reasoning
+                        print(reasoning, end="", flush=True)
+                        
+                    # 2. 获取并拼接最终正文内容
+                    content = delta.content
+                    if content:
+                        display_content += content
+                        final_content += content
+                        print(content, end="", flush=True)
+                        
+                    # 将包含 CoT 的完整记录更新到 WebUI 存储中
+                    if thread_id:
+                        streaming_store[thread_id] = display_content
+            
+            print("\n--- [Code Generator] 流式输出结束 ---\n")
+            
+            # 使用正则提取 Markdown 格式中的 python 代码块，仅在纯正文(final_content)中检索
+            match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
             if match:
                 generated_code = match.group(1).strip()
             else:
                 # 如果没有找到代码块，直接返回内容或者做兜底处理
-                generated_code = full_content
+                generated_code = final_content
                 
             return {"generated_code": generated_code}
             
@@ -149,50 +179,60 @@ def code_generator_node(state: GraphState, config: RunnableConfig = None):
 
 def trap_classifier_node(state: GraphState):
     """Node 3: 陷阱分类器"""
+    print("\n---> [Node: trap_classifier] 开始执行...", flush=True)
     question = state.get("question_context", "")
     problem_type = state.get("problem_type", "")
+    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
     
     # 针对几何题目使用独立的Prompt，其余题目使用通用的Prompt
     if problem_type == "几何":
-        system_prompt = os.getenv("TRAP_CLASSIFIER_PROMPT_几何", "You are an expert at identifying logical traps in geometry problems. You must include either '可解' or '不可解' in your response.")
+        system_prompt = os.getenv("TRAP_CLASSIFIER_PROMPT_几何", "You are an expert at identifying logical traps in geometry problems.")
     else:
-        system_prompt = os.getenv("TRAP_CLASSIFIER_PROMPT", "You are an expert at identifying logical traps in math problems. You must include either '可解' or '不可解' in your response.")
+        system_prompt = os.getenv("TRAP_CLASSIFIER_PROMPT", "You are an expert at identifying logical traps in math problems.")
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
+    try:
+        if support_structured:
+            response = client.beta.chat.completions.parse(
                 model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Analyze the following problem for logical traps or missing conditions:\n\n{question}\n\nRespond with a comprehensive trap analysis. Note: Your response MUST contain the exact word '不可解' if it has traps/missing conditions, or '可解' if it is solvable."}
+                    {"role": "user", "content": f"Analyze the following problem for logical traps or missing conditions:\n\n{question}"}
+                ],
+                response_format=TrapResult,
+                temperature=1.0
+            )
+            result = response.choices[0].message.parsed
+            return {
+                "trap_analysis": result.is_trap,
+                "trap_reason": result.trap_reason
+            }
+        else:
+            prompt_with_instructions = system_prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"is_trap\": <bool>, \"trap_reason\": <string>}. Use 'pass' for trap_reason if there is no trap. Do not use code blocks."
+            response = client.chat.completions.create(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt_with_instructions},
+                    {"role": "user", "content": f"Analyze the following problem for logical traps or missing conditions:\n\n{question}"}
                 ],
                 temperature=1.0
             )
-            content = response.choices[0].message.content
-            
-            if "不可解" in content:
-                return {"trap_analysis": True}
-            elif "可解" in content:
-                return {"trap_analysis": False}
-            else:
-                print(f"--- [Trap Classifier] 未检测到 '可解' 或 '不可解'，正在打回重新生成... ({attempt+1}/{max_retries}) ---")
-                continue
-        except Exception as e:
-            print(f"Error in trap classifier: {e}")
-            return {"trap_analysis": False}
-            
-    # 如果达到最大重试次数仍然不符合格式，默认当做可解题（无陷阱）以保证流转
-    print("--- [Trap Classifier] 超过最大重试次数，默认标记为可解(False)。 ---")
-    return {"trap_analysis": False}
-
-def parallel_sync_node(state: GraphState):
-    """虚拟同步节点: 汇聚并行的 Node 2 和 Node 3 结果"""
-    # 状态汇聚会自动处理并更新对应的字段，这里无需做额外修改直接返回空字典或者是需要整理的其他字段
-    return {}
+            content = response.choices[0].message.content.strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            result_dict = json.loads(content)
+            return {
+                "trap_analysis": bool(result_dict.get("is_trap", False)),
+                "trap_reason": result_dict.get("trap_reason", "pass")
+            }
+    except Exception as e:
+        print(f"Error calling OpenAI API in trap classifier: {e}")
+        return {
+            "trap_analysis": False,
+            "trap_reason": "pass"
+        }
 
 def code_executor_node(state: GraphState):
     """Node 4: 安全代码沙盒执行器"""
+    print("\n---> [Node: code_executor] 开始执行...", flush=True)
     generated_code = state.get("generated_code", "")
     if not generated_code.strip():
         return {"execution_output": "Error: No code to execute."}
@@ -245,6 +285,7 @@ def code_executor_node(state: GraphState):
 
 def judge_node(state: GraphState):
     """Node 5: 裁判 (The Judge)"""
+    print("\n---> [Node: judge] 开始执行...", flush=True)
     question = state.get("question_context", "")
     ground_truth = state.get("ground_truth", "")
     execution_output = state.get("execution_output", "")
@@ -278,10 +319,11 @@ def judge_node(state: GraphState):
             result = response.choices[0].message.parsed
             return {
                 "confidence_score": float(result.confidence),
-                "final_decision": result.decision
+                "final_decision": result.decision,
+                "verified_ans": result.verified_ans
             }
         else:
-            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\"}. Do not use code blocks."
+            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\", \"verified_ans\": <string>}. Use 'pass' for verified_ans if decision is Match. Do not use code blocks."
             response = client.chat.completions.create(
                 model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
                 messages=[
@@ -295,13 +337,15 @@ def judge_node(state: GraphState):
             result_dict = json.loads(content)
             return {
                 "confidence_score": float(result_dict.get("confidence", 0)),
-                "final_decision": result_dict.get("decision", "Error")
+                "final_decision": result_dict.get("decision", "Error"),
+                "verified_ans": result_dict.get("verified_ans", "pass")
             }
     except Exception as e:
         print(f"Error calling OpenAI API in judge: {e}")
         return {
             "confidence_score": 0.0,
-            "final_decision": "Error"
+            "final_decision": "Error",
+            "verified_ans": "pass"
         }
 
 def human_review_node(state: GraphState):
@@ -310,22 +354,23 @@ def human_review_node(state: GraphState):
     print("--- [HITL] 人工审查节点触发，处理并向下流转 ---")
     return {}
 
+def route_after_trap(state: GraphState) -> str:
+    """如果发现陷阱，不再生成代码，直接去结尾"""
+    if state.get("trap_analysis", False) is True:
+        print(f"\n>>> [路由] 发现逻辑陷阱: {state.get('trap_reason')}\n>>> 终止其余节点，直接输出。")
+        return "end"
+    return "code_generator"
+
 def route_after_judge(state: GraphState) -> str:
     """条件路由逻辑"""
-    trap_analysis = state.get("trap_analysis", False)
     confidence = state.get("confidence_score", 0.0)
 
-    # 1. 发现陷阱 -> 废题
-    if trap_analysis is True:
-        print("\n>>> [路由] 发现逻辑陷阱，直接废弃结论。")
-        return "end"
-    
-    # 2. 裁判置信度低 -> 进人工打断
-    elif confidence < 75:
+    # 1. 裁判置信度低 -> 进人工打断
+    if confidence < 75:
         print(f"\n>>> [路由] 置信度为 {confidence} < 75，转入人工审查 (HITL)...")
         return "human_review"
         
-    # 3. 否则 -> 直通终点
+    # 2. 否则 -> 直通终点
     else:
         print(f"\n>>> [路由] 置信度为 {confidence} >= 75，直接输出终局结论。")
         return "end"
@@ -334,9 +379,8 @@ def route_after_judge(state: GraphState) -> str:
 workflow = StateGraph(GraphState)
 
 workflow.add_node("type_classifier", type_classifier_node)
-workflow.add_node("code_generator", code_generator_node)
 workflow.add_node("trap_classifier", trap_classifier_node)
-workflow.add_node("parallel_sync", parallel_sync_node)
+workflow.add_node("code_generator", code_generator_node)
 workflow.add_node("code_executor", code_executor_node)
 workflow.add_node("judge", judge_node)
 workflow.add_node("human_review", human_review_node)
@@ -344,16 +388,21 @@ workflow.add_node("human_review", human_review_node)
 # 从起点连向类型分类器
 workflow.add_edge(START, "type_classifier")
 
-# 节点 1 将图分叉流向 Node 2 (代码生成器) 以及 Node 3 (陷阱分类器)
-workflow.add_edge("type_classifier", "code_generator")
+# 节点 1 流向 Node 3 (陷阱分类器) - 优先串行执行检查
 workflow.add_edge("type_classifier", "trap_classifier")
 
-# Node 2 和 Node 3 汇聚走到同步节点
-workflow.add_edge("code_generator", "parallel_sync")
-workflow.add_edge("trap_classifier", "parallel_sync")
+# 根据 Node 3 (陷阱分类器) 的结果，如果有陷阱则直接终止到 END；否则正常流转到代码生成器
+workflow.add_conditional_edges(
+    "trap_classifier",
+    route_after_trap,
+    {
+        "end": END,
+        "code_generator": "code_generator"
+    }
+)
 
-# 同步节点流向 Node 4 代码执行器
-workflow.add_edge("parallel_sync", "code_executor")
+# 代码生成器流向代码执行器
+workflow.add_edge("code_generator", "code_executor")
 
 # 代码执行器流向裁判节点
 workflow.add_edge("code_executor", "judge")
@@ -386,7 +435,7 @@ graph_app = workflow.compile(
 if __name__ == "__main__":
     print("欢迎使用 LangGraph 工作流控制台！")
     print("请发送包含问题和参考答案的消息，使用 `|` 分隔。")
-    print("例如：`已知 a+b=3，a-b=1，求 a*b。 | 2`")
+    print("例如：`在 $7$ 维单位超正方体（所有坐标均在 $[0, 1]$ 之间）中，随机均匀地取出 $5$ 个点。如果点 $A$ 的所有坐标轴数值都大于点 $B$，则称 $A$ 支配 $B$。求这 $5$ 个点中，没有任何一个点被其他点“支配”的概率。 | 0.87`")
     print("输入 'q' 退出。\n")
     
     while True:

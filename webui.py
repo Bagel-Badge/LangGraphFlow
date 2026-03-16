@@ -58,25 +58,40 @@ def start_run(data: RunData):
     }
     
     def run_graph():
+        print(f"\n[WebUI] 收到新请求开始图构建: {data.question[:20]}...", flush=True)
         try:
             sessions[thread_id]["nodes"]["type_classifier"] = {"status": "executing"}
             # 通过 generator 一步步执行
             for update in graph_app.stream(initial_state, config=config, stream_mode="updates"):
                 for node_name, node_update in update.items():
+                    print(f"\n[WebUI] 节点 '{node_name}' 执行完成.", flush=True)
                     sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
                     sessions[thread_id]["state"].update(node_update)
+                
+                # 获取接下来要执行的节点，将其状态设置为 executing
+                current_state = graph_app.get_state(config)
+                for next_node in current_state.next:
+                    if next_node == "human_review":
+                        continue  # human_review 会在循环结束后判断是否 blocked
+                    if next_node not in sessions[thread_id]["nodes"]:
+                        sessions[thread_id]["nodes"][next_node] = {"status": "executing"}
+                    elif sessions[thread_id]["nodes"][next_node].get("status") != "success":
+                        sessions[thread_id]["nodes"][next_node]["status"] = "executing"
             
             # 判断是否被人工审核打断
             state_info = graph_app.get_state(config)
             needs_hitl = state_info.next and "human_review" in state_info.next
             if needs_hitl:
+                print(f"\n[WebUI] 流程中断，等待人工审查 (HITL)...", flush=True)
                 sessions[thread_id]["status"] = "blocked"
                 sessions[thread_id]["nodes"]["human_review"] = {"status": "blocked", "data": {"message": "Waiting for manual review..."}}
             else:
+                print(f"\n[WebUI] 流程执行完毕，到达 END.", flush=True)
                 sessions[thread_id]["status"] = "finished"
-                sessions[thread_id]["nodes"]["__end__"] = {"status": "success"}
+                sessions[thread_id]["nodes"]["__end__"] = {"status": "success", "data": sessions[thread_id]["state"]}
 
         except Exception as e:
+            print(f"\n[WebUI] 执行过程中发生错误: {e}", flush=True)
             sessions[thread_id]["status"] = "error"
             sessions[thread_id]["error"] = str(e)
             
@@ -117,13 +132,29 @@ def resume_run(thread_id: str, data: HumanDecision):
     
     def resume_graph():
         try:
+            current_state = graph_app.get_state(config)
+            for next_node in current_state.next:
+                if next_node not in sessions[thread_id]["nodes"]:
+                    sessions[thread_id]["nodes"][next_node] = {"status": "executing"}
+                elif sessions[thread_id]["nodes"][next_node].get("status") != "success":
+                    sessions[thread_id]["nodes"][next_node]["status"] = "executing"
+
             for update in graph_app.stream(None, config=config, stream_mode="updates"):
                 for node_name, node_update in update.items():
                     sessions[thread_id]["nodes"][node_name] = {"status": "success", "data": node_update}
                     sessions[thread_id]["state"].update(node_update)
+                
+                current_state = graph_app.get_state(config)
+                for next_node in current_state.next:
+                    if next_node == "human_review":
+                        continue
+                    if next_node not in sessions[thread_id]["nodes"]:
+                        sessions[thread_id]["nodes"][next_node] = {"status": "executing"}
+                    elif sessions[thread_id]["nodes"][next_node].get("status") != "success":
+                        sessions[thread_id]["nodes"][next_node]["status"] = "executing"
             
             sessions[thread_id]["status"] = "finished"
-            sessions[thread_id]["nodes"]["__end__"] = {"status": "success"}
+            sessions[thread_id]["nodes"]["__end__"] = {"status": "success", "data": sessions[thread_id]["state"]}
         except Exception as e:
             sessions[thread_id]["status"] = "error"
             sessions[thread_id]["error"] = str(e)
@@ -132,4 +163,4 @@ def resume_run(thread_id: str, data: HumanDecision):
     return {"status": "success"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8001, access_log=False)
