@@ -40,24 +40,43 @@ def type_classifier_node(state: GraphState):
     """Node 1: 分类器"""
     question = state.get("question_context", "")
     prompt = os.getenv("TYPE_CLASSIFIER_PROMPT", "You are an expert math problem classifier...")
+    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
     
     try:
-        response = client.beta.chat.completions.parse(
-            model="gemini-3-flash-preview",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
-            ],
-            response_format=ClassificationResult,
-            temperature=1.0
-        )
-        
-        result = response.choices[0].message.parsed
-        return {
-            "problem_type": result.problem_type,
-            "hierarchy": result.hierarchy,
-            "difficulty": result.difficulty
-        }
+        if support_structured:
+            response = client.beta.chat.completions.parse(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
+                ],
+                response_format=ClassificationResult,
+                temperature=1.0
+            )
+            result = response.choices[0].message.parsed
+            return {
+                "problem_type": result.problem_type,
+                "hierarchy": result.hierarchy,
+                "difficulty": result.difficulty
+            }
+        else:
+            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"problem_type\": \"几何|代数|概率|数论\", \"hierarchy\": \"初中|高中|本科|硕士及以上\", \"difficulty\": \"基础|进阶|竞赛\"}. Do not use code blocks."
+            response = client.chat.completions.create(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt_with_instructions},
+                    {"role": "user", "content": f"Please classify the following question:\n\n{question}"}
+                ],
+                temperature=1.0
+            )
+            content = response.choices[0].message.content.strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            result_dict = json.loads(content)
+            return {
+                "problem_type": result_dict.get("problem_type", "代数"),
+                "hierarchy": result_dict.get("hierarchy", "高中"),
+                "difficulty": result_dict.get("difficulty", "基础")
+            }
     except Exception as e:
         print(f"Error calling OpenAI API: {e}")
         # 如果调用失败时的默认 fallback，保证流程继续
@@ -84,7 +103,7 @@ def code_generator_node(state: GraphState):
     
     try:
         response = client.chat.completions.create(
-            model="gemini-3.1-pro-preview",
+            model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Please solve the following problem:\n\n{question}"}
@@ -122,7 +141,7 @@ def trap_classifier_node(state: GraphState):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="gemini-3-flash-preview",
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Analyze the following problem for logical traps or missing conditions:\n\n{question}\n\nRespond with a comprehensive trap analysis. Note: Your response MUST contain the exact word '不可解' if it has traps/missing conditions, or '可解' if it is solvable."}
@@ -222,23 +241,41 @@ def judge_node(state: GraphState):
 [Sandbox Execution Output]
 {execution_output}
 """
+    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
     
     try:
-        response = client.beta.chat.completions.parse(
-            model="gemini-3-flash-preview",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_content}
-            ],
-            response_format=JudgeResult,
-            temperature=1.0
-        )
-        
-        result = response.choices[0].message.parsed
-        return {
-            "confidence_score": float(result.confidence),
-            "final_decision": result.decision
-        }
+        if support_structured:
+            response = client.beta.chat.completions.parse(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                response_format=JudgeResult,
+                temperature=1.0
+            )
+            result = response.choices[0].message.parsed
+            return {
+                "confidence_score": float(result.confidence),
+                "final_decision": result.decision
+            }
+        else:
+            prompt_with_instructions = prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"confidence\": <int>, \"decision\": \"Match\" or \"Mismatch\" or \"Error\"}. Do not use code blocks."
+            response = client.chat.completions.create(
+                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
+                messages=[
+                    {"role": "system", "content": prompt_with_instructions},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=1.0
+            )
+            content = response.choices[0].message.content.strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            result_dict = json.loads(content)
+            return {
+                "confidence_score": float(result_dict.get("confidence", 0)),
+                "final_decision": result_dict.get("decision", "Error")
+            }
     except Exception as e:
         print(f"Error calling OpenAI API in judge: {e}")
         return {
