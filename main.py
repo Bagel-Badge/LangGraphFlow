@@ -9,9 +9,14 @@ from openai import OpenAI
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
 
 load_dotenv()
 client = OpenAI()
+
+# 全局存储流式输出用于前端展示
+streaming_store = {}
+
 
 class ClassificationResult(BaseModel):
     problem_type: Literal["几何", "代数", "概率", "数论"]
@@ -86,10 +91,11 @@ def type_classifier_node(state: GraphState):
             "difficulty": "基础"
         }
 
-def code_generator_node(state: GraphState):
+def code_generator_node(state: GraphState, config: RunnableConfig = None):
     """Node 2: 代码生成器"""
     question = state.get("question_context", "")
     problem_type = state.get("problem_type", "代数")
+    thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
     
     # 根据题目类型加载对应的 prompt
     prompt_env_map = {
@@ -101,29 +107,44 @@ def code_generator_node(state: GraphState):
     env_key = prompt_env_map.get(problem_type, "CODE_GEN_PROMPT_代数")
     system_prompt = os.getenv(env_key, "You are a helpful coding assistant.")
     
-    try:
-        response = client.chat.completions.create(
-            model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Please solve the following problem:\n\n{question}"}
-            ],
-            temperature=1.0
-        )
-        content = response.choices[0].message.content
-        
-        # 使用正则提取 Markdown 格式中的 python 代码块
-        match = re.search(r'```python\n(.*?)\n```', content, re.DOTALL)
-        if match:
-            generated_code = match.group(1).strip()
-        else:
-            # 如果没有找到代码块，直接返回内容或者做兜底处理
-            generated_code = content
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Please solve the following problem:\n\n{question}"}
+                ],
+                temperature=1.0,
+                stream=True,
+                timeout=15.0  # 若15s无响应抛出异常，触发重试
+            )
             
-        return {"generated_code": generated_code}
-    except Exception as e:
-        print(f"Error in code generator: {e}")
-        return {"generated_code": "print('Error generating code')"}
+            full_content = ""
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    full_content += chunk.choices[0].delta.content
+                    if thread_id:
+                        streaming_store[thread_id] = full_content
+            
+            # 使用正则提取 Markdown 格式中的 python 代码块
+            match = re.search(r'```python\n(.*?)\n```', full_content, re.DOTALL)
+            if match:
+                generated_code = match.group(1).strip()
+            else:
+                # 如果没有找到代码块，直接返回内容或者做兜底处理
+                generated_code = full_content
+                
+            return {"generated_code": generated_code}
+            
+        except Exception as e:
+            print(f"Error in code generator (attempt {attempt+1}): {e}")
+            if attempt == 2:
+                # 如果重试3次均失败，在此处阻塞，不要继续进行
+                print("Code generator failed 3 times. Blocking execution.")
+                raise Exception("Code generation failed after 3 attempts. Blocked.")
+    
+    return {"generated_code": "print('Error generating code')"}
 
 
 def trap_classifier_node(state: GraphState):

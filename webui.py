@@ -87,6 +87,15 @@ def start_run(data: RunData):
 def get_status(thread_id: str):
     if thread_id not in sessions:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
+        
+    import main
+    if thread_id in main.streaming_store:
+        # 如果代码生成器节点尚未写入最终结果，则向其中注入当前的流式文本
+        if "code_generator" in sessions[thread_id]["nodes"]:
+            node_info = sessions[thread_id]["nodes"]["code_generator"]
+            if node_info.get("status") == "executing" or "generated_code" not in node_info.get("data", {}):
+                node_info["data"] = {"streaming_content": main.streaming_store[thread_id]}
+                
     return sessions[thread_id]
 
 @app.post("/api/resume/{thread_id}")
