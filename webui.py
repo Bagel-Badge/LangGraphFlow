@@ -92,6 +92,21 @@ def get_task():
         return {"has_task": True, "task": task.dict()}
     return {"has_task": False}
 
+@app.get("/api/active_sessions")
+def get_active_sessions():
+    active = []
+    for tid, session in sessions.items():
+        if session.get("status") not in ["cancelled", "error"]:
+            active.append({
+                "thread_id": tid,
+                "task_id": session.get("state", {}).get("question_id", ""),
+                "question": session.get("state", {}).get("question_context", ""),
+                "truth": session.get("state", {}).get("ground_truth", ""),
+                "status": session.get("status"),
+                "nodes": session.get("nodes", {})
+            })
+    return {"sessions": active[:8]}
+
 @app.get("/api/task_result/{task_id}")
 def get_task_result(task_id: str):
     # Iterate through all sessions to find the one matching task_id

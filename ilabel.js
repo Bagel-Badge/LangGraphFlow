@@ -7,6 +7,9 @@
 // @match        *://ilabel.alipay.com/*
 // @match        file:///*
 // @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
 // ==/UserScript==
 
 (function() {
@@ -45,6 +48,26 @@
         // 视觉反馈
         debugPanel.style.borderColor = "#FFF";
         setTimeout(() => { debugPanel.style.borderColor = "#444"; }, 500);
+    };
+
+    // 定义手动清除后台任务的方法
+    window.cancelLangGraphTask = function(taskId) {
+        console.log(`🗑️ 手动触发清空后台任务: ${taskId}`);
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: "http://localhost:8001/api/cancel_task",
+            data: JSON.stringify({ "task_id": taskId }),
+            headers: { "Content-Type": "application/json" },
+            onload: function() { 
+                console.log("✅ 发送清空命令成功"); 
+                let btn = document.getElementById("cancel-task-btn-" + taskId);
+                if (btn) {
+                    btn.innerText = "已清空";
+                    btn.style.background = "#888";
+                    btn.disabled = true;
+                }
+            }
+        });
     };
 
     function updateDebugUI(currentScreenTaskId, statusMsg = "") {
@@ -105,6 +128,9 @@
         if (resultPollingTimer) clearInterval(resultPollingTimer);
         resultDisplayed = false;
         
+        // 初始显示加载中状态
+        displayPendingState(taskId);
+        
         resultPollingTimer = setInterval(() => {
             if (!taskId || resultDisplayed) {
                 clearInterval(resultPollingTimer);
@@ -113,7 +139,7 @@
             
             GM_xmlhttpRequest({
                 method: "GET",
-                url: `http://127.0.0.1:8001/api/task_result/${taskId}`,
+                url: `http://localhost:8001/api/task_result/${taskId}`,
                 onload: function(response) {
                     try {
                         let res = JSON.parse(response.responseText);
@@ -130,48 +156,64 @@
         }, 3000);
     }
 
+    function createBaseResultWindow(taskId) {
+        let resultDiv = document.getElementById("langgraph-result-window");
+        if (!resultDiv) {
+            resultDiv = document.createElement("div");
+            resultDiv.id = "langgraph-result-window";
+            resultDiv.style.cssText = `
+                position: fixed; bottom: 20px; right: 20px;
+                background: rgba(0, 0, 0, 0.85); color: #00FF00;
+                padding: 15px; border-radius: 8px; font-family: monospace;
+                font-size: 13px; z-index: 1000000; pointer-events: auto;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.5); min-width: 300px; max-width: 400px;
+                border: 1px solid #444; word-wrap: break-word; line-height: 1.5;
+            `;
+            document.body.appendChild(resultDiv);
+        }
+        return resultDiv;
+    }
+
+    function displayPendingState(taskId) {
+        let taskInfo = getTaskUUIDElement();
+        if (!taskInfo || taskInfo.text !== taskId) return;
+
+        let resultDiv = createBaseResultWindow(taskId);
+        
+        let content = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <strong style="color:white; font-size:14px;">🤖 LangGraph 推理结果</strong>
+            <button id="cancel-task-btn-${taskId}" onclick="window.cancelLangGraphTask('${taskId}')" style="cursor:pointer; background:#f5222d; color:white; border:none; padding:2px 8px; border-radius:4px; font-size:11px;">清空后台任务</button>
+        </div><hr style="border-color:#444; margin:5px 0;">`;
+        
+        content += `<span style="color:yellow">⏳ 正在等待 LangGraph 后台计算，请稍候...</span><br>`;
+        resultDiv.innerHTML = content;
+        resultDiv.dataset.taskId = taskId;
+    }
+
     function displayResult(data, taskId) {
         let taskInfo = getTaskUUIDElement();
         if (!taskInfo || taskInfo.text !== taskId) return;
         
-        let rect = taskInfo.el.getBoundingClientRect();
+        let resultDiv = createBaseResultWindow(taskId);
         
-        let resultDiv = document.createElement("div");
-        resultDiv.id = "langgraph-result-" + taskId;
-        resultDiv.style.cssText = `
-            position: absolute;
-            top: ${rect.bottom + window.scrollY}px;
-            left: ${rect.right + window.scrollX + 10}px;
-            background: #f6ffed;
-            border: 1px solid #b7eb8f;
-            color: #389e0d;
-            padding: 10px;
-            border-radius: 6px;
-            font-size: 13px;
-            z-index: 1000000;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            max-width: 350px;
-            word-wrap: break-word;
-            line-height: 1.5;
-        `;
+        let content = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <strong style="color:white; font-size:14px;">🤖 LangGraph 推理结果</strong>
+            <button id="cancel-task-btn-${taskId}" onclick="window.cancelLangGraphTask('${taskId}')" style="cursor:pointer; background:#f5222d; color:white; border:none; padding:2px 8px; border-radius:4px; font-size:11px;">清空后台任务</button>
+        </div><hr style="border-color:#444; margin:5px 0;">`;
         
-        let content = `<strong style="color:#096dd9">[LangGraph WebUI 结果]</strong><br>`;
-        content += `<b>层级:</b> ${data.hierarchy || '无'} &nbsp;|&nbsp; <b>难度:</b> ${data.difficulty || '无'}<br>`;
-        content += `<b>类型:</b> ${data.problem_type || '无'}<br>`;
+        content += `<span style="color:#00BFFF">层级:</span> <span style="color:#FFF">${data.hierarchy || '无'}</span> &nbsp;|&nbsp; <span style="color:#00BFFF">难度:</span> <span style="color:#FFF">${data.difficulty || '无'}</span><br>`;
+        content += `<span style="color:#00BFFF">类型:</span> <span style="color:#FFF">${data.problem_type || '无'}</span><br>`;
+        
         if (data.trap_analysis) {
-             content += `<span style="color:#f5222d">⚠️ <b>陷阱:</b> ${data.trap_reason}</span><br>`;
+             content += `<br><span style="color:#FF00FF">⚠️ 陷阱:</span> <span style="color:#FFF">${data.trap_reason}</span><br>`;
         }
         if (data.final_decision) {
-             let color = data.final_decision.includes('Match') ? '#389e0d' : '#f5222d';
-             content += `<span style="color:${color}"><b>裁判结论:</b> ${data.final_decision}</span> (置信度: ${data.confidence_score})<br>`;
+             let color = data.final_decision.includes('Match') ? '#00FF00' : '#f5222d';
+             content += `<br><span style="color:#00BFFF">裁判结论:</span> <span style="color:${color}"><b>${data.final_decision}</b></span> <span style="color:#888">(置信度: ${data.confidence_score})</span><br>`;
         }
         
         resultDiv.innerHTML = content;
-        
-        let old = document.getElementById("langgraph-result-" + taskId);
-        if (old) old.remove();
-        
-        document.body.appendChild(resultDiv);
+        resultDiv.dataset.taskId = taskId;
     }
 
     // ==========================================
@@ -254,7 +296,7 @@
             console.log("📝 提取到题目与答案，准备发送...");
             GM_xmlhttpRequest({
                 method: "POST",
-                url: "http://127.0.0.1:8001/api/task_data",
+                url: "http://localhost:8001/api/task_data",
                 data: JSON.stringify({
                     "task_id": taskId || "unknown",
                     "question_content": questionContent,
@@ -396,13 +438,19 @@
             if (resultPollingTimer) clearInterval(resultPollingTimer);
             GM_xmlhttpRequest({
                 method: "POST",
-                url: "http://127.0.0.1:8001/api/cancel_task",
+                url: "http://localhost:8001/api/cancel_task",
                 data: JSON.stringify({
                     "task_id": lastProcessedTaskId
                 }),
                 headers: { "Content-Type": "application/json" },
                 onload: function(res) { console.log("✅ 发送清空命令成功") }
             });
+
+            // 清理悬浮窗
+            let resultDiv = document.getElementById("langgraph-result-window");
+            if (resultDiv) {
+                resultDiv.remove();
+            }
 
             releaseTask();
             lastProcessedTaskId = null;

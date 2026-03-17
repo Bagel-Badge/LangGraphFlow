@@ -55,21 +55,21 @@
       return '#ffffff'; // White default
     }
 
-    function GraphInstance({ instanceId }) {
+    function GraphInstance({ instanceId, initialSession }) {
       const [nodes, setNodes] = useState(INITIAL_NODES);
       const [edges, setEdges] = useState(INITIAL_EDGES);
       
-      const [threadId, setThreadId] = useState(null);
+      const [threadId, setThreadId] = useState(initialSession ? initialSession.thread_id : null);
       const [selectedNode, setSelectedNode] = useState(null);
       const [nodeData, setNodeData] = useState({});
       
-      const [question, setQuestion] = useState("");
-      const [truth, setTruth] = useState("");
+      const [question, setQuestion] = useState(initialSession ? initialSession.question : "");
+      const [truth, setTruth] = useState(initialSession ? initialSession.truth : "");
       const [statusPoller, setStatusPoller] = useState(null);
       
-      const [sessionStatus, setSessionStatus] = useState('idle'); // idle, running, blocked, finished, error
-      const [autoMode, setAutoMode] = useState(true);
-      const [taskId, setTaskId] = useState("");
+      const [sessionStatus, setSessionStatus] = useState(initialSession ? initialSession.status : 'idle'); // idle, running, blocked, finished, error
+      const [autoMode, setAutoMode] = useState(!initialSession);
+      const [taskId, setTaskId] = useState(initialSession ? initialSession.task_id : "");
 
       const onNodesChange = useCallback(
         (changes) => setNodes((nds) => applyNodeChanges(changes, nds)),
@@ -186,6 +186,35 @@
       const onNodeClick = (_, node) => {
         setSelectedNode(node.id);
       };
+
+      // Initialize with existing session data if available
+      useEffect(() => {
+        if (initialSession && initialSession.thread_id) {
+          setThreadId(initialSession.thread_id);
+          setSessionStatus(initialSession.status);
+          setNodeData(initialSession.nodes || {});
+          
+          // Update nodes and edges based on initial session data
+          const updatedNodes = nodes.map(node => {
+            const nodeInfo = (initialSession.nodes || {})[node.id];
+            return { 
+              ...node, 
+              style: { backgroundColor: getColorForStatus(nodeInfo?.status || '') },
+              data: { ...node.data, ...nodeInfo?.data }
+            };
+          });
+          const updatedEdges = edges.map(edge => {
+            const edgeInfo = initialSession.edges?.find(e => e.id === edge.id);
+            return { 
+              ...edge, 
+              animated: edgeInfo?.status === 'executing',
+              label: edgeInfo?.label || edge.label
+            };
+          });
+          setNodes(updatedNodes);
+          setEdges(updatedEdges);
+        }
+      }, [initialSession]);
 
       return (
         <div className="flex w-full h-full overflow-hidden border flex-col">
@@ -327,6 +356,24 @@
     }
 
     function App() {
+      const [initialSessions, setInitialSessions] = useState([]);
+      const [loaded, setLoaded] = useState(false);
+
+      useEffect(() => {
+        fetch('/api/active_sessions')
+          .then(res => res.json())
+          .then(data => {
+            setInitialSessions(data.sessions || []);
+            setLoaded(true);
+          })
+          .catch(e => {
+            console.error(e);
+            setLoaded(true);
+          });
+      }, []);
+
+      if (!loaded) return <div className="p-4">Loading active instances...</div>;
+
       // Setup grid of 8 GraphInstances
       return (
         <div className="grid grid-cols-4 grid-rows-2 w-full h-full bg-gray-200 gap-1 p-1">
@@ -336,7 +383,7 @@
                 <span>Instance {i + 1}</span>
               </div>
               <div className="flex-1 overflow-hidden relative">
-                <GraphInstance instanceId={i} />
+                <GraphInstance instanceId={i} initialSession={initialSessions[i] || null} />
               </div>
             </div>
           ))}

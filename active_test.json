@@ -1,0 +1,1 @@
+{"sessions":[{"thread_id":"8bfc1569-56bb-4785-8070-79a818bbb97b","task_id":"test_1","question":"test q","truth":"test t","status":"running","nodes":{"__start__":{"status":"success","data":{"question_id":"test_1","question_context":"test q","ground_truth":"test t"}},"type_classifier":{"status":"executing"}}}]}
