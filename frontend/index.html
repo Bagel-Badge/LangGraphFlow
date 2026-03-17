@@ -55,7 +55,7 @@
       return '#ffffff'; // White default
     }
 
-    function GraphInstance({ instanceId, initialSession }) {
+    function GraphInstance({ instanceId, initialSession, onThreadIdChange }) {
       const [nodes, setNodes] = useState(INITIAL_NODES);
       const [edges, setEdges] = useState(INITIAL_EDGES);
       
@@ -90,6 +90,7 @@
             body: JSON.stringify({ question: q, truth: t, task_id: tid })
           });
           const data = await res.json();
+          if (onThreadIdChange) onThreadIdChange(instanceId, data.thread_id);
           setThreadId(data.thread_id);
           setNodeData({});
           
@@ -186,6 +187,11 @@
         
         return () => { active = false; clearInterval(poller); };
       }, [autoMode, sessionStatus]);
+
+      // Report threadId to parent so App can track ownership
+      useEffect(() => {
+        if (onThreadIdChange) onThreadIdChange(instanceId, threadId);
+      }, [instanceId, threadId, onThreadIdChange]);
 
       const onNodeClick = (_, node) => {
         setSelectedNode(node.id);
@@ -375,13 +381,45 @@
     function App() {
       const [initialSessions, setInitialSessions] = useState([]);
       const [loaded, setLoaded] = useState(false);
+      const instanceThreadIdsRef = useRef({});
+
+      const handleThreadIdChange = useCallback((instanceId, threadId) => {
+        if (threadId) {
+          instanceThreadIdsRef.current[instanceId] = threadId;
+        } else {
+          delete instanceThreadIdsRef.current[instanceId];
+        }
+      }, []);
 
       useEffect(() => {
         const fetchActive = () => {
           fetch(`/api/active_sessions?_t=${Date.now()}`)
             .then(res => res.json())
             .then(data => {
-              setInitialSessions(data.sessions || []);
+              const allSessions = data.sessions || [];
+              const claimed = instanceThreadIdsRef.current;
+              const claimedSet = new Set(Object.values(claimed));
+
+              const result = new Array(8).fill(null);
+
+              // First pass: place sessions into their claimed instance slots
+              for (const [idStr, tid] of Object.entries(claimed)) {
+                const session = allSessions.find(s => s.thread_id === tid);
+                if (session) {
+                  result[parseInt(idStr)] = session;
+                }
+              }
+
+              // Second pass: distribute unclaimed sessions into empty slots
+              const unclaimed = allSessions.filter(s => !claimedSet.has(s.thread_id));
+              let ui = 0;
+              for (let i = 0; i < 8 && ui < unclaimed.length; i++) {
+                if (!result[i]) {
+                  result[i] = unclaimed[ui++];
+                }
+              }
+
+              setInitialSessions(result);
               if (!loaded) setLoaded(true);
             })
             .catch(e => {
@@ -389,7 +427,7 @@
               if (!loaded) setLoaded(true);
             });
         };
-        
+
         fetchActive();
         const interval = setInterval(fetchActive, 2000);
         return () => clearInterval(interval);
@@ -406,7 +444,7 @@
                 <span>Instance {i + 1}</span>
               </div>
               <div className="flex-1 overflow-hidden relative">
-                <GraphInstance instanceId={i} initialSession={initialSessions[i] || null} />
+                <GraphInstance instanceId={i} initialSession={initialSessions[i] || null} onThreadIdChange={handleThreadIdChange} />
               </div>
             </div>
           ))}
