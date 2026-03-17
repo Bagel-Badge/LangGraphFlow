@@ -2,6 +2,7 @@ from typing import TypedDict, Any, Literal
 import os
 import json
 import re
+import time
 import docker
 import requests
 from dotenv import load_dotenv
@@ -22,10 +23,6 @@ class ClassificationResult(BaseModel):
     problem_type: Literal["几何", "代数", "概率", "数论"]
     hierarchy: Literal["初中", "高中", "本科", "硕士及以上"]
     difficulty: Literal["基础", "进阶", "竞赛"]
-
-class TrapResult(BaseModel):
-    is_trap: bool
-    trap_reason: str
 
 class JudgeResult(BaseModel):
     confidence: int
@@ -99,136 +96,111 @@ def type_classifier_node(state: GraphState):
             "difficulty": "基础"
         }
 
-def code_generator_node(state: GraphState, config: RunnableConfig = None):
-    """Node 2: 代码生成器"""
-    print("\n---> [Node: code_generator] 开始执行...", flush=True)
+def analyze_and_solve_node(state: GraphState, config: RunnableConfig = None):
+    """Node 2: 陷阱分析 + 代码生成 (合并节点，使用强模型)"""
+    print("\n---> [Node: analyze_and_solve] 开始执行...", flush=True)
     question = state.get("question_context", "")
     problem_type = state.get("problem_type", "代数")
     thread_id = config.get("configurable", {}).get("thread_id", None) if config else None
-    
-    # 根据题目类型加载对应的 prompt
+
+    # 根据题目类型加载对应的合并 prompt
     prompt_env_map = {
-        "几何": "CODE_GEN_PROMPT_几何",
-        "代数": "CODE_GEN_PROMPT_代数",
-        "概率": "CODE_GEN_PROMPT_概率",
-        "数论": "CODE_GEN_PROMPT_数论"
+        "几何": "ANALYZE_AND_SOLVE_PROMPT_几何",
+        "代数": "ANALYZE_AND_SOLVE_PROMPT_代数",
+        "概率": "ANALYZE_AND_SOLVE_PROMPT_概率",
+        "数论": "ANALYZE_AND_SOLVE_PROMPT_数论"
     }
-    env_key = prompt_env_map.get(problem_type, "CODE_GEN_PROMPT_代数")
-    system_prompt = os.getenv(env_key, "You are a helpful coding assistant.")
-    
-    for attempt in range(3):
+    env_key = prompt_env_map.get(problem_type, "ANALYZE_AND_SOLVE_PROMPT_代数")
+    system_prompt = os.getenv(env_key, "You are a helpful math assistant.")
+
+    attempt = 0
+    error_codes = []
+
+    while True:
         try:
             response = client.chat.completions.create(
                 model=os.getenv("MODEL_PRO", "gemini-3.1-pro-preview"),
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Please solve the following problem:\n\n{question}"}
+                    {"role": "user", "content": f"请分析并求解以下题目：\n\n{question}"}
                 ],
                 temperature=1.0,
                 stream=True,
-                timeout=60.0  # 扩大到60s。此处为底层连接读取的间隔超时，接收CoT片段时不会判定为超时
+                timeout=60.0
             )
-            
+
             display_content = ""  # 用于前端实时展示，包含 CoT 和正文
-            final_content = ""    # 仅包含正文，用于最终正则提取代码
-            
-            print("\n--- [Code Generator] 开始流式输出 ---\n", end="")
+            final_content = ""    # 仅包含正文，用于最终解析
+
+            print("\n--- [Analyze & Solve] 开始流式输出 ---\n", end="")
             for chunk in response:
                 if chunk.choices:
                     delta = chunk.choices[0].delta
                     delta_dict = delta.model_dump()
-                    
+
                     # 1. 获取并拼接思维链内容 (CoT)
                     reasoning = delta_dict.get("reasoning_content")
                     if reasoning:
                         display_content += reasoning
                         print(reasoning, end="", flush=True)
-                        
+
                     # 2. 获取并拼接最终正文内容
                     content = delta.content
                     if content:
                         display_content += content
                         final_content += content
                         print(content, end="", flush=True)
-                        
+
                     # 将包含 CoT 的完整记录更新到 WebUI 存储中
                     if thread_id:
                         streaming_store[thread_id] = display_content
-            
-            print("\n--- [Code Generator] 流式输出结束 ---\n")
-            
-            # 使用正则提取 Markdown 格式中的 python 代码块，仅在纯正文(final_content)中检索
-            match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
-            if match:
-                generated_code = match.group(1).strip()
+
+            print("\n--- [Analyze & Solve] 流式输出结束 ---\n")
+
+            # 判断模型是否拒绝答题（检测到陷阱）
+            if "[TRAP_DETECTED]" in final_content:
+                trap_text = final_content.split("[TRAP_DETECTED]", 1)[1].strip()
+                # 取第一行作为 trap_reason，截断到100字
+                trap_reason = trap_text.split("\n")[0].strip()[:100]
+                if not trap_reason:
+                    trap_reason = "模型检测到逻辑陷阱但未给出原因"
+
+                print(f"\n>>> [陷阱检测] 发现逻辑陷阱: {trap_reason}")
+                return {
+                    "trap_analysis": True,
+                    "trap_reason": trap_reason,
+                    "generated_code": "pass"
+                }
             else:
-                # 如果没有找到代码块，直接返回内容或者做兜底处理
-                generated_code = final_content
-                
-            return {"generated_code": generated_code}
-            
+                # 正常代码生成，提取 python 代码块
+                match = re.search(r'```python\n(.*?)\n```', final_content, re.DOTALL)
+                if match:
+                    generated_code = match.group(1).strip()
+                else:
+                    generated_code = final_content
+
+                return {
+                    "trap_analysis": False,
+                    "trap_reason": "pass",
+                    "generated_code": generated_code
+                }
+
         except Exception as e:
-            print(f"Error in code generator (attempt {attempt+1}): {e}")
-            if attempt == 2:
-                # 如果重试3次均失败，在此处阻塞，不要继续进行
-                print("Code generator failed 3 times. Blocking execution.")
-                raise Exception("Code generation failed after 3 attempts. Blocked.")
-    
-    return {"generated_code": "print('Error generating code')"}
+            attempt += 1
+            is_429 = (hasattr(e, 'status_code') and e.status_code == 429) or '429' in str(e)
+            error_codes.append(429 if is_429 else 0)
+            print(f"Error in analyze_and_solve (attempt {attempt}): {e}", flush=True)
 
-
-def trap_classifier_node(state: GraphState):
-    """Node 3: 陷阱分类器"""
-    print("\n---> [Node: trap_classifier] 开始执行...", flush=True)
-    question = state.get("question_context", "")
-    problem_type = state.get("problem_type", "")
-    support_structured = os.getenv("SUPPORT_STRUCTURED_OUTPUT", "True").lower() == "true"
-    
-    # 针对几何题目使用独立的Prompt，其余题目使用通用的Prompt
-    if problem_type == "几何":
-        system_prompt = os.getenv("TRAP_CLASSIFIER_PROMPT_几何", "You are an expert at identifying logical traps in geometry problems.")
-    else:
-        system_prompt = os.getenv("TRAP_CLASSIFIER_PROMPT", "You are an expert at identifying logical traps in math problems.")
-    
-    try:
-        if support_structured:
-            response = client.beta.chat.completions.parse(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Analyze the following problem for logical traps or missing conditions:\n\n{question}"}
-                ],
-                response_format=TrapResult,
-                temperature=1.0
-            )
-            result = response.choices[0].message.parsed
-            return {
-                "trap_analysis": result.is_trap,
-                "trap_reason": result.trap_reason
-            }
-        else:
-            prompt_with_instructions = system_prompt + "\n\nPlease return ONLY a JSON object string exactly matching this schema: {\"is_trap\": <bool>, \"trap_reason\": <string>}. Use 'pass' for trap_reason if there is no trap. Do not use code blocks."
-            response = client.chat.completions.create(
-                model=os.getenv("MODEL_FLASH", "gemini-3-flash-preview"),
-                messages=[
-                    {"role": "system", "content": prompt_with_instructions},
-                    {"role": "user", "content": f"Analyze the following problem for logical traps or missing conditions:\n\n{question}"}
-                ],
-                temperature=1.0
-            )
-            content = response.choices[0].message.content.strip()
-            content = content.replace("```json", "").replace("```", "").strip()
-            result_dict = json.loads(content)
-            return {
-                "trap_analysis": bool(result_dict.get("is_trap", False)),
-                "trap_reason": result_dict.get("trap_reason", "pass")
-            }
-    except Exception as e:
-        print(f"Error calling OpenAI API in trap classifier: {e}")
-        return {
-            "trap_analysis": False,
-            "trap_reason": "pass"
-        }
+            if attempt >= 3:
+                # 检查最近3次是否全部为429
+                if all(code == 429 for code in error_codes[-3:]):
+                    print(f"连续3次触发429限流，等待15s后继续重试...", flush=True)
+                    time.sleep(15)
+                    attempt = 0
+                    error_codes.clear()
+                    continue
+                else:
+                    raise Exception(f"analyze_and_solve 连续失败3次 (非全部429限流)，阻塞: {e}")
 
 def code_executor_node(state: GraphState):
     """Node 4: 安全代码沙盒执行器"""
@@ -393,12 +365,12 @@ def human_review_node(state: GraphState):
     print("--- [HITL] 人工审查节点触发，处理并向下流转 ---")
     return {}
 
-def route_after_trap(state: GraphState) -> str:
-    """如果发现陷阱，不再生成代码，直接去结尾"""
+def route_after_analyze(state: GraphState) -> str:
+    """如果发现陷阱，不再执行代码，直接去结尾"""
     if state.get("trap_analysis", False) is True:
         print(f"\n>>> [路由] 发现逻辑陷阱: {state.get('trap_reason')}\n>>> 终止其余节点，直接输出。")
         return "end"
-    return "code_generator"
+    return "code_executor"
 
 def route_after_judge(state: GraphState) -> str:
     """条件路由逻辑"""
@@ -418,8 +390,7 @@ def route_after_judge(state: GraphState) -> str:
 workflow = StateGraph(GraphState)
 
 workflow.add_node("type_classifier", type_classifier_node)
-workflow.add_node("trap_classifier", trap_classifier_node)
-workflow.add_node("code_generator", code_generator_node)
+workflow.add_node("analyze_and_solve", analyze_and_solve_node)
 workflow.add_node("code_executor", code_executor_node)
 workflow.add_node("judge", judge_node)
 workflow.add_node("human_review", human_review_node)
@@ -427,21 +398,18 @@ workflow.add_node("human_review", human_review_node)
 # 从起点连向类型分类器
 workflow.add_edge(START, "type_classifier")
 
-# 节点 1 流向 Node 3 (陷阱分类器) - 优先串行执行检查
-workflow.add_edge("type_classifier", "trap_classifier")
+# 类型分类器流向合并节点（陷阱分析 + 代码生成）
+workflow.add_edge("type_classifier", "analyze_and_solve")
 
-# 根据 Node 3 (陷阱分类器) 的结果，如果有陷阱则直接终止到 END；否则正常流转到代码生成器
+# 根据合并节点的结果，如果有陷阱则直接终止到 END；否则正常流转到代码执行器
 workflow.add_conditional_edges(
-    "trap_classifier",
-    route_after_trap,
+    "analyze_and_solve",
+    route_after_analyze,
     {
         "end": END,
-        "code_generator": "code_generator"
+        "code_executor": "code_executor"
     }
 )
-
-# 代码生成器流向代码执行器
-workflow.add_edge("code_generator", "code_executor")
 
 # 代码执行器流向裁判节点
 workflow.add_edge("code_executor", "judge")

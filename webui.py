@@ -96,7 +96,7 @@ async def get_task():
 async def get_active_sessions():
     active = []
     for tid, session in sessions.items():
-        if session.get("status") not in ["cancelled", "error"]:
+        if session.get("status") not in ["cancelled"]:
             active.append({
                 "thread_id": tid,
                 "task_id": session.get("state", {}).get("question_id", ""),
@@ -188,6 +188,11 @@ async def start_run(data: RunData):
             print(f"\n[WebUI] 执行过程中发生错误: {e}", flush=True)
             sessions[thread_id]["status"] = "error"
             sessions[thread_id]["error"] = str(e)
+            # 将当前正在执行的节点标记为 error，便于前端红色标注
+            for node_name, node_info in sessions[thread_id]["nodes"].items():
+                if isinstance(node_info, dict) and node_info.get("status") == "executing":
+                    node_info["status"] = "error"
+                    node_info["data"] = {"error": str(e)}
             
     threading.Thread(target=run_graph, daemon=True).start()
     return {"thread_id": thread_id}
@@ -200,8 +205,8 @@ async def get_status(thread_id: str):
     import main
     if thread_id in main.streaming_store:
         # 如果代码生成器节点尚未写入最终结果，则向其中注入当前的流式文本
-        if "code_generator" in sessions[thread_id]["nodes"]:
-            node_info = sessions[thread_id]["nodes"]["code_generator"]
+        if "analyze_and_solve" in sessions[thread_id]["nodes"]:
+            node_info = sessions[thread_id]["nodes"]["analyze_and_solve"]
             if node_info.get("status") == "executing" or "generated_code" not in node_info.get("data", {}):
                 node_info["data"] = {"streaming_content": main.streaming_store[thread_id]}
                 

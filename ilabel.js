@@ -424,7 +424,26 @@
         if (!isSkipping) updateDebugUI(currentScreenTaskId);
 
         if (currentScreenTaskId && currentScreenTaskId !== lastProcessedTaskId) {
-            if (lastProcessedTaskId) releaseTask();
+            // SPA切题：旧任务存在时，先执行完整清理
+            if (lastProcessedTaskId) {
+                console.log(`🔄 SPA切题，清理旧任务: ${lastProcessedTaskId}`);
+                if (resultPollingTimer) clearInterval(resultPollingTimer);
+                // 仅当我们确实向后端提交过此任务时，才发送cancel请求
+                if (hasSentData) {
+                    console.log(`🗑️ 已提交过的任务，发送cancel: ${lastProcessedTaskId}`);
+                    GM_xmlhttpRequest({
+                        method: "POST",
+                        url: "http://localhost:8001/api/cancel_task",
+                        data: JSON.stringify({ "task_id": lastProcessedTaskId }),
+                        headers: { "Content-Type": "application/json" },
+                        onload: function(res) { console.log("✅ 旧任务清空命令已发送") }
+                    });
+                }
+                let resultDiv = document.getElementById("langgraph-result-window");
+                if (resultDiv) resultDiv.remove();
+                releaseTask();
+                hasSentData = false;
+            }
 
             lastProcessedTaskId = currentScreenTaskId;
 
@@ -452,28 +471,8 @@
             }
         }
         else if (!currentScreenTaskId && lastProcessedTaskId && !isSkipping) {
-            // Task has been removed/completed
-            console.log(`🗑️ 任务完成或切题，清空任务: ${lastProcessedTaskId}`);
-            if (resultPollingTimer) clearInterval(resultPollingTimer);
-            GM_xmlhttpRequest({
-                method: "POST",
-                url: "http://localhost:8001/api/cancel_task",
-                data: JSON.stringify({
-                    "task_id": lastProcessedTaskId
-                }),
-                headers: { "Content-Type": "application/json" },
-                onload: function(res) { console.log("✅ 发送清空命令成功") }
-            });
-
-            // 清理悬浮窗
-            let resultDiv = document.getElementById("langgraph-result-window");
-            if (resultDiv) {
-                resultDiv.remove();
-            }
-
-            releaseTask();
-            lastProcessedTaskId = null;
-            hasSentData = false; // 用户切题后清除标记
+            // UUID暂时消失（DOM渲染间隙），不做任何处理，等待下一轮检测
+            // cancel请求只在UUID确认切换(A→B)时发送，避免闪烁误触发
         }
 
         let jitterDelay = 400 + Math.random() * 300;
